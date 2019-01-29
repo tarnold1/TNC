@@ -1,0 +1,1371 @@
+#!/usr/bin/perl
+#******************************************************************************
+#
+#   File name : BinToBinExtract.pl
+#   Purpose   : To parse through a Unison program and create a .csv file with:
+#                  TestNumbers  TestGroupName  BinName  SWBin  HWBin  BinComments
+#               Target U5/UDIG programs only and use the TestProg's ActiveBinMap.
+#
+#               Constraints/Limitations/(looking for the right word here)
+#               - All stand-alone TestGroup objects are parsed and stored.
+#               - All SubFlow TestGroup definitions are parsed and stored, if any Inheritance, then
+#                 the Inherited TestGroup is 'pulled' into the SubFlow TestGroup's definition.
+#               - Only the SubFlow TestGroups are processed according to the flow walk rules defined in
+#                 'WalkSubFlow' subroutine.
+#               - No Unison expressions are evaluted.
+#               - No Unison .cpp code is parsed.
+#   History   :
+$rev =          "R1.0";  # 180131 wmk  Original coding
+$rev =          "R2.0";  # 180426 wmk  Added capability to parse and execute through SubFlow-defined TestGroups.
+$rev =          "R2.1";  # 181102 wmk  Differentiate FlowControl FlowNodes from EndofSubFlow FlowNodes.
+#
+#
+#
+#
+#*******************************************************************************
+#   
+#*******************************************************************************
+
+# -------------------------------------------------------------------------
+sub DocumentHistory {
+    print "\nHistory:\n";
+    print "R1.0\n";
+    print "\t180131 : \n";
+    print "\t-  Initial release per customer request 1/31/2018.\n";
+
+    print "\n\t180301 :\n";
+    print "\t-  Per updated request (180228), added the parent SubFlow for each TestGroup.\n";
+    
+    print "R2.0\n";
+    print "\t180601 :\n";
+    print "\t-  SubFlow-defined (locally defined vs Inherited) TestGroups were missing from the .csv file. Now\n";
+    print "\t   processed and added.\n";
+    print "\t-  Other statements that contribute to TestNumbers and Binning are now parsed and used to set these\n";
+    print "\t   parameters. These include: \n";
+    print "\t   -  Per-Block MinorID and FailBin arguments\n";
+    print "\t   -  LimitTable/LimitStructures/TestLimitSource\n";
+    print "\t   -  CallAfterSetup/CallAtEnd FunctionCalls\n";
+    print "\t-  Also parsing for and storing TestGroup and Block __EnableExpression, Block LowLimit, HighLimit,\n";
+    print "\t   DatalogText, and TestPins data.\n";
+    print "\t-  Added new invocation option '-C[ustomer] <CustomerKey>' to facilitate the creation of Customer-specific\n";
+    print "\t   output. Requires a unique Customer key to enable the negotiated Customer-specific features.\n";
+
+    print "R2.1\n";
+    print "\t181102 :\n";
+    print "\t-  Added check for non-existance of Port0 to differentiate a FlowControl FlowNode from\n";
+    print "\t   an End of SubFlow FlowNode.\n";
+    print "\t-  Follow Port1 of FlowControl decision FlowNodes to extract any TestGroup data from this PortConnection.\n";
+    print "\t-  Removed decision to rename TestGroupName based on the inheritance of a stand-alone TestGroup object.\n";
+    print "\t-  Removed check of (\$BinName ne \"\") to determine whether TestGroup is output to .csv file. This now\n";  # 181107 (Check with Microchip!)
+    print "\t   allows TestGroups with no Port1 Bin to be logged to the .csv file.\n";
+    
+    #print "R2.2\n";
+    #print "\\t1811xx :\n";
+    #print "\t-  \n";
+    #print "\t-  \n";
+    #print "\t-  \n";
+    
+    die "\n";
+}
+
+($module_path, $ConverterName) = $0 =~ /(.*\/)*(.*)/;
+$module_path !~ s,/[^/]*$,, && ($module_path = '.');            # extract the path of this Perl script
+push(@INC, join('', $_, $module_path));                         # add this path to look for 'require'd' Perl files
+use File::Copy;
+use File::Path;
+use File::Find;
+use Cwd;
+require "ctime.pl";
+# require "enVisionProgramGeneration.pl";
+# require "UnisonProgramGeneration.pl";
+require "UtilityFunctions.pl";
+
+# Determine operating system
+&DetermineOperatingSystem();
+
+$DefaultPath            = "../Patterns/PatternSource";
+$UNISON_DIR             = "UnisonDir";
+$cmd_opt{'Source'}         = "Unison";                          # default Unison,    options [enVision]
+$cmd_opt{'TargetPlatform'} = "Diamond";                         # default Diamond,   options [Diamond|Diamond]
+$cmd_opt{'TargetOS'}       = "Unison";
+# $DigitalType = "D96";          # D96 (DPIN96-xx), FX (FX1, FX2, FX-HS, FX-HV), MP (MPT (Tornado)), GX (Stinger)
+$cmd_opt{'DigitalPinType'} = "D96";                             # default D96,       options [D96|FX|MP|GX]
+$cmd_opt{'Model'}          = "UDIG";                            # default UDIG
+$cmd_opt{'log'}            = 0;
+$CaseDecision           = "Upper";
+$CaseDecision           = "AsIs";
+$debug                  = 0;                                    # 4 for 'parsing <ObjectType> <ObjectName>...'
+
+$OS_Target = $ENV{'TARGET_NAME'};
+
+&parse_CommandLine;                                             # parse command line for conversion directives
+
+$SPEAR_version          = $cmd_opt{'SPEAR_version'};
+
+if ($cmd_opt{'TargetOS'} eq "Unison") {
+    if ($OS_Target !~ /^U\d/) { $OS_Target = "U5.0"; }          # set default Unison OS, UDIG introduced in U5.0
+    # &generate_UnisonHeaderStatement($OS_Target, *UnisonHeader);
+}
+if ($cmd_opt{'TargetOS'} eq "Unison") {
+    $TargetDir = $UNISON_DIR;
+    $PatSrcDir = "./Patterns/PatternSource";                    # not changeable by User (post-parse_CommandLine)
+    $DefaultSourcePath = "../Patterns/PatternSource";
+    $DefaultBinaryPath = "../Patterns/PatternBinary";
+}
+$Customer = "Microchip";                                        # set default
+# if any customer-specific, set $Customer...
+if (exists($cmd_opt{'Customer'})) {
+    $Customer = $cmd_opt{'Customer'};
+}
+
+&Session_Initialize;
+
+if ($cmd_opt{'log'} == 1) { open(STDOUT, "| tee -ai ConversionTranscript_$date_stamp.log"); }
+
+# --------------------------------- main ---------------------------------
+#180426 printf "\n------  %s to %s (%s mode) Conversion,  Rev. $rev ----------------------\n", $cmd_opt{'Source'}, $cmd_opt{'TargetOS'}, $cmd_opt{'Model'};
+printf "\n------  %s Flow/TestGroup/Bin Audit,  Rev. $rev ----------------------\n", $cmd_opt{'Source'};
+$start_conversion_time = $^T;
+$start_time = &ctime($start_conversion_time);
+$start_time =~ s/\n//;
+
+$CurrentWorkingDirectory = cwd();
+$CurrentWorkingDirectory =~ s/(.*?)\/?([\w\.\-]+)$/$2/;         # extract and retain last leaf
+
+# mkdir("./$TargetDir", 0777);                                    # make target (enVision/ITE/Unison) subdirectory
+if ($cmd_opt{'TargetOS'} eq "Unison") {
+    # &create_Unison_ProgramStructure($TargetDir);                # in 'UnisonProgramGeneration.pl'
+}
+
+if ($cmd_opt{'unaFileName'} ne "") {
+    # make sure file exists
+    if (-e $cmd_opt{'unaFileName'}) {
+        ($cmd_opt{'unaFileName'} =~ /^\.?\/?([\w\.\-]+)/) && do { # get ParentDirectory (first leaf)
+            $ParentDirectory = $1;
+            $U5_Directory = sprintf("%s_U5", $ParentDirectory);
+                                    # ($CurrentPath eq "./") ? "$CurrentWorkingDirectory" : "$CurrentPath");
+        };
+        # get ParentDirectory
+        # get unaFileName
+        # get unaPath
+        if ($cmd_opt{'unaFileName'} =~ /\//) {
+            $cmd_opt{'unaFileName'} =~ /(.*)\/([\w\.\-]+)$/ && do {
+                $CurrentPath = $1;
+                $File        = $2;
+            };
+        }
+        else {
+            $CurrentPath = "./";
+            $File        = $cmd_opt{'unaFileName'};
+        }
+        $una_FileName = $File;
+        
+        $una_BaseFileName = $una_FileName;
+        $una_BaseFileName =~ s/\.una$//;
+        
+        # open file
+        open(UNA, "$cmd_opt{'unaFileName'}");
+        $/ = "__!!__";
+        $UnisonData = <UNA>;
+        
+        # parse the .eva/.una file...
+        print ">> -- Parsing Unison objects from \"$cmd_opt{'unaFileName'}\"\n";
+        $ExternalRefStackIndex++;
+        $ExternalRefStack[$ExternalRefStackIndex]->{'File'} = $File;
+        $ExternalRefStack[$ExternalRefStackIndex]->{'Path'} = "./";
+
+        # call the object Parser... parse the entire Unison program.
+        &ParseObjects($CurrentPath, $File, $UnisonData);        # in 'UtilityFunctions.pl'
+
+        # close file
+        close(UNA);
+        $/ = "\n";
+        
+        # %ObjectData{$ObjectName}->{'Path'}
+        #            {$ObjectName}->{'File'}
+        #            {$ObjectName}->{'Type'}
+        #            {$ObjectName}->{'Data'}
+        # @ObjectNavigator[0] = $NavIndex;
+        # @ObjectNavigator[$NavIndex]->{'ObjectName'}
+        # @ObjectNavigator[$NavIndex]->{'Type'}
+        # @ObjectNavigator[$NavIndex]->{'Data'} = "";
+        # @ObjectNavigator[$NavIndex]->{'Path'}
+        # @ObjectNavigator[$NavIndex]->{'File'}
+
+        # Process the Unison objects...
+#        foreach $ObjectName (sort keys (%ObjectData)) {
+#            if ($ObjectData{$ObjectName}->{'Type'} eq "__TestProg") {
+#                $TestProg = $ObjectName;
+#            }
+#        }
+        $break = 1;
+        
+        for $NavIndex (1..$ObjectNavigator[0]) {
+            $ObjectName = $ObjectNavigator[$NavIndex]->{'ObjectName'};
+            $ObjectType = $ObjectNavigator[$NavIndex]->{'Type'};
+            # $ObjectPath = $ObjectNavigator[$NavIndex]->{'Path'};
+            # $File       = $ObjectNavigator[$NavIndex]->{'File'};
+            # $ObjectData = $ObjectData{$ObjectName}->{'Data'};
+            $break = 1;
+
+            # __TestProg
+            #    get ActiveBinMap
+            #    get ActiveFlow
+            #    get ActiveLimitTable
+            if ($ObjectType eq "__TestProg") {
+                $TestProg = $ObjectName;
+
+                $TestProgData = $ObjectData{$TestProg}->{'Data'};
+
+                # __BinMap = ActiveBinMap;
+                $TestProgData =~ /__BinMap\s*=\s*(\w+)\s*;/     && ($ActiveBinMap     = $1);  # ActiveBinMap is...
+                # __Flow = flow_cte;
+                $TestProgData =~ /__Flow\s*=\s*(\w+)\s*;/       && ($ActiveFlow       = $1);
+                # __LimitTable = Limits;
+                $TestProgData =~ /__LimitTable\s*=\s*(\w+)\s*;/ && ($ActiveLimitTable = $1);
+            }
+            # __PinGroup
+            elsif ($ObjectType eq "__PinGroup") {
+                $PinGroupName = $ObjectName;
+                &parse_PinGroup($PinGroupName);
+            }
+            # __BinMap
+            elsif ($ObjectType eq "__BinMap") {
+                $BinMapName = $ObjectName;
+                &parse_BinMap($BinMapName);
+            }
+            # __Bin
+            elsif ($ObjectType eq "__Bin") {
+                $BinName = $ObjectName;
+                &parse_Bin($BinName);
+            }
+            # __FunctionCall
+            elsif ($ObjectType eq "__FunctionCall") {
+                $FunctionCallName = $ObjectName;
+                &parse_FunctionCall($FunctionCallName);
+            }
+            # __LimitTable
+            elsif ($ObjectType eq "__LimitTable") {
+                $LimitTableName = $ObjectName;
+                &parse_LimitTable($LimitTableName);
+            }
+            # __SubFlow
+            elsif ($ObjectType eq "__SubFlow") {
+                $SubFlowName = $ObjectName;
+                &parse_SubFlow($SubFlowName);
+            }
+            # __TestGroup
+            elsif ($ObjectType eq "__TestGroup") {
+                $TestGroupName = $ObjectName;
+                &parse_TestGroup($TestGroupName);
+            }
+        }  # end of 'for $NavIndex (1..$ObjectNavigator[0])'
+
+        $break = 1;
+
+        # from ActiveFlow
+        #    get OnStartSubFlow...
+        $FlowData     = $ObjectData{$ActiveFlow}->{'Data'};
+        # OnStart = flow_pkg_iqc_OnStart;
+        $FlowData     =~ /OnStart\s*=\s*(\w+)\s*;/     && ($OnStartSubFlow      = $1);
+        # OnReset = TINY44A_OnReset;
+        $FlowData     =~ /OnReset\s*=\s*(\w+)\s*;/     && ($OnResetSubFlow      = $1);
+        # OnInitFlow = TINY44A_OnInitFlow;
+        $FlowData     =~ /OnInitFlow\s*=\s*(\w+)\s*;/  && ($OnInitSubFlow       = $1);
+        # OnLoad = TINY44A_OnLoad;
+        $FlowData     =~ /OnLoad\s*=\s*(\w+)\s*;/      && ($OnLoadSubFlow       = $1);
+        # OnPowerDown = TINY44A_OnPowerDown;
+        $FlowData     =~ /OnPowerDown\s*=\s*(\w+)\s*;/ && ($OnPowerDownSubFlow  = $1);
+        # UsrCal = TINY44A_UsrCal;
+        $FlowData     =~ /UsrCal\s*=\s*(\w+)\s*;/      && ($UsrCalSubFlow       = $1);
+        # OnUnload = TINY44A_OnUnload;
+        $FlowData     =~ /OnUnload\s*=\s*(\w+)\s*;/    && ($OnUnloadSubFlow     = $1);
+        # OnBeginLot = TINY44A_OnBeginLot;
+        $FlowData     =~ /OnBeginLot\s*=\s*(\w+)\s*;/  && ($OnBeginLotSubFlow   = $1);
+        # OnEndLot = TINY44A_OnEndLot;
+        $FlowData     =~ /OnEndLot\s*=\s*(\w+)\s*;/    && ($OnEndLotSubFlow     = $1);
+
+
+        if ($Customer eq "pSemi") {
+            printf "Customization for %s\n", $Customer;
+        }
+    
+        &openBinToBinExtractCSV();
+
+        $Index = 0;
+        print ">> -- Walking the Flow - starting with \"$OnStartSubFlow\".\n";
+        &WalkSubFlow($OnStartSubFlow);
+        
+        close(CSV);
+    }
+    else {
+        &UserMessage('Error', "Couldn't open the .una/.uno file \"$cmd_opt{'unaFileName'}\".\n");
+        die;
+    }
+}
+
+print "\nErrors: $Errors->{'ErrorCount'}    Warnings: $Errors->{'WarningCount'}    UserInfo: $Errors->{'UserInfoCount'}\n";
+
+$stop_conversion_time = time;
+$stop_time = &ctime($stop_conversion_time);
+$stop_time =~ s/\n//;
+print "\n$cmd_opt{'Source'} BinToBinExtraction Done        \@ $stop_time   \(Conversion time ", ($stop_conversion_time-$start_conversion_time), "sec.\)\n";
+
+if ($cmd_opt{'log'} == 1) { close(STDOUT); }
+
+# End of program
+
+
+# -------------------------------------------------------------------------
+sub parse_CommandLine {
+    # Command line processing
+    if ($#ARGV == -1) { &Usage; }
+    
+    $command_line = join (':', @ARGV);
+    
+    if ($command_line =~ s/:?-hist?o?r?y?//i) {              # output History
+        &DocumentHistory;
+    }
+    else {
+        @CommandLineOptions = split(/\:/, $command_line);
+    }
+
+    $command_line =~ s/:?-un?[ao]?\s*:\s*([\w\~\.\-\/\$]+)// && do {
+        $cmd_opt{'unaFileName'} = $1;
+        $cmd_opt{'unaFileName'} =~ s/^\.\///;                   # remove leading './'
+    };
+
+    &ParseForCommonCommandLineArguments(*command_line);         # -p[latform], -t[argetOS], -dig[type], -m[odel]
+
+    # [-C[ustomer] <CustomerKey>]       (candidate for ParseForCommonCommandLineArguments)
+    $command_line =~ s/:?-Cu?s?t?o?m?e?r?\s*:\s*([\w]+)// && do {       # must be -C
+        $CustomerKey = $1;
+        # use a LUT to 'decode' the customer key
+        if (!exists($CustomerLUT{$CustomerKey})) {
+            &UserMessage('Error', "Invalid Customer key \'$1\'. Program aborting.");
+            exit;
+        }
+        $cmd_opt{'Customer'} = $CustomerLUT{$CustomerKey};
+    };
+
+    # -d[ebug]
+    $command_line =~ s/:?-de?b?u?g?\s*:?\s*(\d*)// && do {      # sets debug mode
+        $debug = $1;
+        if ($debug eq '') { $debug = 1; }
+    };
+    $command_line =~ (s/:?-lo?g?//i) && do {
+        $cmd_opt{'log'} = 1;
+    };
+
+    return;
+}
+
+# --------------------------------------------------------------------------
+sub Usage {
+    print "\nUsage: $ConverterName [-C[ustomer] <CustomerKey>] [-l[og]] [-his[tory]] [-d[ebug] [n]] -u[na] <unaFileName>\n";
+    print "\nCommand line options for UDIG Conversions :\n";
+    #print "\t-d[ebug] #                       : \n";
+    #                  4
+    #                  8
+    #                  9
+    print "\t-C[ustomer] <CustomerKey>        : Allows for negotiated, Customer-specific Unison program output. Requires\n";
+    print "\t                                   a unique Customer key.\n";
+    print "\t-l[og]                           : All screen output is logged to the file './ConversionTranscript<time_stamp>.log'.\n";
+    print "\t-his[tory]                       : Revision information, feature enhancements and bug fixes.\n";
+    print "\t-u[na] <unaFileName>             : Path and filename of the Unison .una file.\n";
+    print "\nExamples:\n";
+    print "\t$ConverterName -his\n";
+    print "\t$ConverterName -u ScanTest_AUT_110524.una\n";
+    print "\t$ConverterName -C MyKey -l -u ScanTest_AUT_110524.una\n";
+    print "\nRevision $rev\n";
+    die "\n";
+}
+
+# -------------------------------------------------------------------------
+sub Session_Initialize {
+    
+    &EstablishKeywords();                                       # in 'UtilityFunctions.pl'
+    
+    $ExternalRefCount   = 0;
+    $ExternalRefStackIndex = -1;
+    $NavIndex           = 0;
+
+    $Errors->{'ErrorCount'} = $Errors->{'WarningCount'} = $Errors->{'UserInfoCount'} = 0;
+    
+    $date = `date "+%e %b %Y"`;
+    chop($date);
+    $date_stamp = `date "+%y%m%d"`;
+    chop($date_stamp);
+}
+
+# -------------------------------------------------------------------------
+sub parse_PinGroup {
+    local($PinGroupName) = @_;
+    ($debug == 4) && printf "\tparsing __PinGroup $PinGroupName...\n";
+
+    $tempGroup = $ObjectData{$PinGroupName}->{'Data'};
+    $tempGroup =~ s/[\n\s]//g;                                  # remove all '\n's, whitespace
+    $tempGroup =~ /\"([\w\+\-]+)\"/ && ($tempSignals = $1);
+    @tempSignals = split(/\+/, $tempSignals);                   # !!! what about -Pins???
+    
+    $PinGroupData{$PinGroupName}[0]->{'PinCount'} = $#tempSignals+1;
+    for (0..$#tempSignals) { $PinGroupData{$PinGroupName}[$_+1]->{'PinName'} = $tempSignals[$_]; }
+}
+
+# -------------------------------------------------------------------------
+sub parse_BinMap {
+    local($BinMapName) = @_;
+    ($debug == 4) && printf "\tparsing __BinMap $BinMapName...\n";
+
+    # __BinMap <name> {
+    #     __Bin <Bname> = <Hbin>;
+    #     __Bin <Bname> = <Hbin>;
+    #     __Bin <Bname> = <Hbin>;
+    # }
+    #
+    # __BinMap flow_pkg_BinMap {
+    #     __Bin bin_st_watchdog_min = 278;
+    #     __Bin bin_st_coreabist_min = 271;
+    #     __Bin bin_st_coreabist_max = 71;
+    #     __Bin evDefaultBin = 0;
+    # }
+    
+    $BinMapObjectData = $ObjectData{$BinMapName}->{'Data'};
+    while ($BinMapObjectData =~ s/__Bin\s+(\w+)\s*=\s*(\d+)\s*;//) {
+        $BinName = $1;
+        $Hbin    = $2;
+
+        $BinMapData{$BinMapName}->{$BinName} = $Hbin;
+    }
+}
+
+# -------------------------------------------------------------------------
+sub parse_Bin {
+    local($BinName) = @_;
+    ($debug == 4) && printf "\tparsing __Bin $BinName...\n";
+
+    # __Bin <name> {
+    #     __Comment = "<comment>";
+    #     __Number = <bin>;
+    #     __Result = <pass_fail>;
+    #     __MaxCount = <max_count>;
+    #     __CheckOverFlow = <bypass>;
+    #     __Color = <color>;
+    # }
+    #
+    # __Bin bin_ct_tim16 {
+    #     __Comment = "bin_ct_tim16";
+    #     __Number = 224;
+    #     __Result = __False;
+    #     __CheckOverFlow = __True;
+    #     __Color = 2;
+    # }
+    
+    $BinObjectData = $ObjectData{$BinName}->{'Data'};
+    while ($BinObjectData =~ s/__(Comment|Number|Result|MaxCount|CheckOverFlow|Color)\s*=\s*\"?([\w\s\_]+)\"?\s*;//) {
+        $BinObjectAttribute = $1;
+        $BinObjectAttrValue = $2;
+
+        $BinData{$BinName}->{$BinObjectAttribute} = $BinObjectAttrValue;
+        # $BinData{$BinName}->{'Comment'}       = $1;
+        # $BinData{$BinName}->{'Number'}        = $1;
+        # $BinData{$BinName}->{'Result'}        = $1;
+        # $BinData{$BinName}->{'MaxCount'}      = $1;
+        # $BinData{$BinName}->{'CheckOverFlow'} = $1;
+        # $BinData{$BinName}->{'Color'}         = $1;
+    }
+}
+
+# -------------------------------------------------------------------------
+sub parse_LimitTable {
+    local($LimitTableName) = @_;
+    ($debug == 4) && printf "\tparsing __LimitTable $LimitTableName...\n";
+
+    $LimitTableObjectData = $ObjectData{$LimitTableName}->{'Data'};
+
+    # __CSVFile = "../Limits/Limits.csv";
+    $LimitTableObjectData =~ /__CSVFile\s*=\s*\"([\w\.\/\~]+)\"\s*;/ && do {
+        $LimitTableFileName = $1;
+        open(LIMITTABLE, "$LimitTableFileName") || die "Couldn't open the LimitTable \"$LimitTableFileName\".\n";
+        $AtLimitStructures = 0;
+        while (<LIMITTABLE>) {
+            chop($LimitStructure = $_);
+
+            $LimitStructure =~ s/^\s*//;                        # remove leading/trailing white space
+            $LimitStructure =~ s/\s*$//;
+
+            if ($LimitStructure =~ /LIMIT_FORMAT:/) {
+                chop($LimitStructure = <LIMITTABLE>);           # this next line specifies the column header...
+                $LimitStructure =~ s/^\s*//;                    # remove leading/trailing white space
+                $LimitStructure =~ s/\s*$//;
+                @LimitStructArray = split(/\s*,\s*/, $LimitStructure);
+                for (0..$#LimitStructArray) { $LimitTableColumnLUT{$LimitStructArray[$_]} = $_; }
+
+                chop($LimitStructure = <LIMITTABLE>);           # this next line is the first LimitStructure
+                $LimitStructure =~ s/^\s*//;                    # remove leading/trailing white space
+                $LimitStructure =~ s/\s*$//;
+                $AtLimitStructures = 1;
+            }
+
+            if ($AtLimitStructures) {
+                @LimitStructArray = split(/\s*,\s*/, $LimitStructure);
+
+                $LimitStructureName = $LimitStructArray[$LimitTableColumnLUT{'NAME'}];
+                # $ActiveLimitTableName            NAME
+                $LimitTableData{$LimitTableName}->{$LimitStructureName}->{'TNUM'}     = $LimitStructArray[$LimitTableColumnLUT{'TNUM'}];
+                $LimitTableData{$LimitTableName}->{$LimitStructureName}->{'LLIMA'}    = $LimitStructArray[$LimitTableColumnLUT{'LLIMA'}];
+                $LimitTableData{$LimitTableName}->{$LimitStructureName}->{'HLIMA'}    = $LimitStructArray[$LimitTableColumnLUT{'HLIMA'}];
+                $LimitTableData{$LimitTableName}->{$LimitStructureName}->{'UNITS'}    = $LimitStructArray[$LimitTableColumnLUT{'UNITS'}];
+                $LimitTableData{$LimitTableName}->{$LimitStructureName}->{'DLOG_STR'} = $LimitStructArray[$LimitTableColumnLUT{'DLOG_STR'}];
+                $LimitTableData{$LimitTableName}->{$LimitStructureName}->{'SW_BINA'}  = $LimitStructArray[$LimitTableColumnLUT{'SW_BINA'}];
+
+                $break = 1;
+            }
+        }
+        close(LIMITTABLE);
+    };
+    $break = 1;
+}
+
+# -------------------------------------------------------------------------
+sub parse_FunctionCall {
+    local($FunctionCallName) = @_;
+    ($debug == 4) && printf "\tparsing __FunctionCall $FunctionCallName...\n";
+
+    $FunctionCallObjectData = $ObjectData{$FunctionCallName}->{'Data'};
+
+    $ParameterIndex = 0;
+    while ($FunctionCallObjectData ne "") {
+        # __WrapCells = __True;
+        $FunctionCallObjectData =~ s/\s*__WrapCells\s*=\s*(__True|__False)\s*;\s*//;
+        # __Function = setupForSerialSend;
+        $FunctionCallObjectData =~ s/\s*__Function\s*=\s*(\w+)\s*;\s*// && ($FunctionCallData{$FunctionCallName}->{'Function'} = $1);
+        # SendPins   = __Expression { __String = "SDATA"; }
+        # ReturnData = __Expression { __String = "#->Capt0Word"; __Mode = Output; }
+        $FunctionCallObjectData =~ s/\s*(\w+)\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"\'?([^\"\']*)\'?\"\s*;\s*[__Mode]*\s*=*\s*[Output]*\s*;*\s*\}\s*// && do {
+            $FunctionCallData{$FunctionCallName}->{'Parameter'}[0]->{'ParameterCount'} = ++$ParameterIndex;
+            $FunctionCallData{$FunctionCallName}->{'Parameter'}[$ParameterIndex]->{'Name'}  = $1;
+            $FunctionCallData{$FunctionCallName}->{'Parameter'}[$ParameterIndex]->{'Value'} = $2;
+        };
+    }
+    $break = 1;
+}
+
+# -------------------------------------------------------------------------
+sub parse_TestGroup {
+    local($TestGroupName) = @_;
+    ($debug == 4) && printf "\tparsing __TestGroup $TestGroupName...\n";
+
+    $TestGroupObjectData = $ObjectData{$TestGroupName}->{'Data'};
+
+    #    'IVIO' => HASH(0x8a6b9b0)
+    #       'Block' => ARRAY(0x8a843cc)
+    #          0  HASH(0x8a843e4)
+    #             'BlockCount'     => 2
+    #          1  HASH(0x8a84408)
+    #             'Title'          => 'IVIO_Test'
+    #             'Enable'         => 'TRUE'
+    #             'ContinueOnFail' => 'TRUE'
+    #             'MinorID'        => 0
+    #             'FailBin'        => 'evResetBin'
+    #             'LimitStructure' => 'IVIO_0_LS'
+    #             'DatalogText'    => 'IVIO'
+    #             'CallAfterSetup' => 'SetTimeDelay_1ms_FC'
+    #             'CallAtEnd'      => 'MeasureCurrent_DAC_CAL_FC'
+    #          2  HASH(0x8a84468)
+    #             'Title'          => 'SaveIvioPostValues_Test'
+    #       'TestID' => 300004
+    #       'TestGroupEnable' => TRUE
+    
+    # __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+    $TestGroupEnable = "TRUE";                                  # default is TRUE
+    $TestGroupObjectData =~ s/__EnableExpression\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*__Type\s*=\s*BOOLEAN\s*;\s*\}// &&
+        { $TestGroupEnable = $1};
+    $TestGroupData{$TestGroupName}->{'TestGroupEnable'} = $TestGroupEnable;
+    
+    # any TestGroup-defined TestID...
+    $TestID = "";
+    $TestGroupObjectData =~ s/__TestID\s*=\s*\"(\d+)\"\s*;// && ($TestID = $1);
+    $TestGroupData{$TestGroupName}->{'TestID'} = $TestID;
+
+    $BlockIndex = 0;
+    @Blocks = split(/\s*__Block\[/, $TestGroupObjectData);
+    foreach $nthBlock (1..$#Blocks) {
+        $BlockData = $Blocks[$nthBlock];
+        $TestGroupData{$TestGroupName}->{'Block'}[0]->{'BlockCount'}++;
+        # __Title
+        # __Title = IVIO_Test;
+        $BlockData =~ s/__Title\s*=\s*(\w+)\s*\;// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'Title'} = $1;
+        };
+        # __EnableExpression
+        # __EnableExpression = __Expression { __String = "TRUE"; }
+        $BlockData =~ s/__EnableExpression\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'Enable'} = $1;
+        };
+        # __ContinueOnFail
+        # __ContinueOnFail = __Expression { __String = "FALSE"; }
+        $BlockData =~ s/__ContinueOnFail\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'ContinueOnFail'} = $1;
+        };
+        # FunctionCalls in CallAfterSetup, CallAtEnd
+        # CallAfterSetup = __Expression { __String = "&Reset_CM_FC"; }
+        # CallAtEnd = __Expression { __String = "&MeasureCurrent_CM_BAND42_ET_FC"; }
+        $BlockData =~ s/CallAfterSetup\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'CallAfterSetup'} = $1;
+        };
+        $BlockData =~ s/CallAtEnd\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'CallAtEnd'} = $1;
+        };
+        # TestLimitSource = __Expression { __String = "LIMITS_TYPE_ENUM:USE_LOCAL_LIMITS"; }
+        # TestLimitSource = __Expression { __String = "LIMITS_TYPE_ENUM:USE_LIMIT_STRUCT"; }
+        # TestLimitSource = __Expression { __String = "DC_LIMITS_TYPE_ENUM:USE_LOCAL_LIMITS"; }
+        # TestLimitSource = __Expression { __String = "DC_LIMITS_TYPE_ENUM:USE_LIMIT_STRUCT"; }
+        # TestLimitSource = __Expression { __String = "DC_LIMITS_TYPE_ENUM:USE_LEVELS_SETUP"; }
+        # TestLimitSource = __Expression { __String = "if (UseLimitStruct, DC_LIMITS_TYPE_ENUM:USE_LIMIT_STRUCT, DC_LIMITS_TYPE_ENUM:USE_LOCAL_LIMITS)"; }
+        $BlockData =~ s/TestLimitSource\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'TestLimitSource'} = $1;
+        };
+        # LimitStructure
+        # LimitStructure = __Expression { __String = "&Cont_IO_Pins_LS"; }
+        $BlockData =~ s/LimitStructure\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'LimitStructure'} = $1;
+        };
+        # MinorID
+        # MinorID = __Expression { __String = "0"; }
+        $BlockData =~ s/\bMinorID\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'MinorID'} = $1;
+        };
+        # LowLimit
+        # LowLimit = __Expression { __String = "-2mA"; }
+        $BlockData =~ s/LowLimit\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'LowLimit'} = $1;
+        };
+        # HighLimit
+        # HighLimit = __Expression { __String = "5mA"; }
+        $BlockData =~ s/HighLimit\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'HighLimit'} = $1;
+        };
+        # DatalogText
+        # DatalogText = __Expression { __String = "'IDD_ISO_DTC0'"; }
+        $BlockData =~ s/DatalogText\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\'([^\']+)\'\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'DatalogText'} = $1;
+        };
+        # FailBin
+        # FailBin = __Expression { __String = "&FailFunc"; }
+        $BlockData =~ s/FailBin\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'FailBin'} = $1;
+        };
+        # TestPins
+        # TestPins = __Expression { __String = "SCLK_SDATA_Pins"; }
+        $BlockData =~ s/TestPins\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+            $TestGroupData{$TestGroupName}->{'Block'}[$nthBlock]->{'TestPins'} = $1;
+        };
+    }  # end of 'foreach $nthBlock (1..$#Blocks)'
+}
+
+# -------------------------------------------------------------------------
+sub parse_SubFlow {
+    local($SubFlowName) = @_;
+    ($debug == 4) && printf "\tparsing __SubFlow $SubFlowName...\n";
+
+    # __SubFlow <name> {
+    #     <subflow_statements>
+    # }
+    #
+    # __SubFlow FinalTest {
+    #     __TestGroup tb_pgm_int_timing_2 {
+    #         __XCoord = (366,407);
+    #         __Port[0] {
+    #             __PortPosition = 82;
+    #         }
+    #         __Port[1] {
+    #             __PortPosition = 102;
+    #         }
+    #         __InputPosition = 277;
+    #         __TestID = "43002";
+    #         __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+    #         __Exec = __Test {
+    #             __Inherit = tb_pgm_int_timing;
+    #             __Block[0] = {
+    #                 __Title = tb_pgm_int_timing_Test;
+    #                 __TestMethod {
+    #                     __Name = tb_pgm_int_timing_function;
+    #                     DataLogText = __Expression { __String = "'tb_pgm_int_timing'"; }
+    #                 }
+    #             }
+    #         }
+    #     }
+    #     __Node FlowNode_3894 {
+    #         __XCoord = (397,601);
+    #         __InputPosition = 0;
+    #         __TestID = "";
+    #         __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+    #         __PortSelect = "0";
+    #         __PortNumber = 0;
+    #     }
+    #     __Node Imprints_Verify_4109 {
+    #         __XCoord = (539,552);
+    #         __Port[0] {
+    #             __PortPosition = 276;
+    #         }
+    #         __InputPosition = 96;
+    #         __TestID = "";
+    #         __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+    #         __Exec = Imprints_Verify;
+    #     }
+    #     __TestGroup tb_pgm_int_timing_0 {
+    #         __XCoord = (379,99);
+    #         __Port[0] {
+    #             __PortPosition = 82;
+    #         }
+    #         __Port[1] {
+    #             __PortPosition = 108;
+    #         }
+    #         __InputPosition = 270;
+    #         __TestID = "43000";
+    #         __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+    #         __Exec = __Test {
+    #             __Inherit = tb_pgm_int_timing;
+    #             __Block[0] = {
+    #                 __Title = tb_pgm_int_timing_Test;
+    #                 __TestMethod {
+    #                     __Name = tb_pgm_int_timing_function;
+    #                     DataLogText = __Expression { __String = "'tb_pgm_int_timing'"; }
+    #                 }
+    #             }
+    #         }
+    #     }
+    #     __Node SelfTest_at_ulv_2176 {
+    #         __XCoord = (238,923);
+    #         __Port[0] {
+    #             __PortPosition = 266;
+    #         }
+    #         __InputPosition = 91;
+    #         __TestID = "";
+    #         __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+    #         __Exec = SelfTest_at_ulv;
+    #     }
+    #     __StartNode = FlowNode_2727;
+    #     __PortConnections {
+    #         tb_pgm_int_timing_2 __Port[0] = Acomp_bandgap_2317;
+    #         tb_pgm_int_timing_2 __Port[1] = Acomp_bandgap_2317;
+    #         Imprints_Verify_4109 __Port[0] = FlowNode_3894;
+    #         tb_pgm_int_timing_5 __Port[0] = Spi_4110;
+    #         tb_pgm_int_timing_5 __Port[1] = Spi_4110;
+    #     }
+    #     __Background {
+    #         __String = "ulv tests, for debug";
+    #         __Data = (0,0,222,883,0,0,22,0,0,6,0,0,1,0,0,0);
+    #     }
+
+    $SubFlowObjectData = $ObjectData{$SubFlowName}->{'Data'};
+
+    # __StartNode
+    $SubFlowObjectData =~ s/__StartNode\s*=\s*(\w+)\s*;// && do {
+        $StartNode = $1;
+        $SubFlowData{$SubFlowName}->{'StartNode'} = $StartNode;
+    };
+    
+    # __PortConnections
+    $SubFlowObjectData =~ s/__PortConnections\s*\{\s*([^\}]*)\s*\}\s*// && do {
+        $PortConnections = $1;
+        $PortConnections =~ s/\n/ /g;
+        while ($PortConnections =~ s/(\w+)\s+__Port\[(\d+)\]\s*=\s*(\w+)\s*;//) {
+            $SourceFlowNode      = $1;
+            $PortNumber          = $2;
+            $DestinationFlowNode = $3;
+            $SubFlowData{$SubFlowName}->{'PortConnections'}->{$SourceFlowNode}[$PortNumber] = $DestinationFlowNode;
+        }
+    };
+
+    # __Background
+    $SubFlowObjectData =~ s/__Background\s*\{\s*([^\}]*)\s*\}\s*// && do {      # just remove...
+    };
+
+    # __TestGroup, __Node
+    @FlowNodes = split(/\s*__TestGroup|__Node\s*/, $SubFlowObjectData);
+    for $FlowNodeIndex (0..$#FlowNodes) {
+        $TestID = "";
+        $Exec   = "";
+        $FlowNodeData = $FlowNodes[$FlowNodeIndex];
+        $FlowNodeData =~ s/\n/ /g;
+        $FlowNodeData =~ s/\s*(\w+)\s*\{// && do {
+            $FlowNodeName = $1;
+            #d printf "\t\t%-5d  %s\n", $FlowNodeIndex, $FlowNodeName;
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Exec'}       = undef;
+        };
+
+        # __Exec = ATmega168PA_FT;                              # SubFlows, Bins
+        $FlowNodeData =~ s/__Exec\s*=\s*(\w+)\s*;// && do {
+            $Exec   = $1;
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Exec'}       = $Exec;
+        };
+        # __Exec = __Test {
+        #     __Inherit = tb_power_short;
+        $FlowNodeData =~ s/__Exec\s*=\s*(\w+)\s*\{// && do {    # always be "__Test"??
+            $Exec   = $1;
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Exec'}       = $Exec;
+            # __Inherit = tb_adc_int_ref;
+            $FlowNodeData =~ s/__Inherit\s*=\s*(\w+)\s*;// && do {
+                $Inherit = $1;
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Inherit'} = $Inherit;
+            };
+        };
+        
+        # __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+        $TestGroupEnable = "TRUE";                                  # default is TRUE
+        $TestGroupObjectData =~ s/__EnableExpression\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*__Type\s*=\s*BOOLEAN\s*;\s*\}// &&
+            { $TestGroupEnable = $1};
+        $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'TestGroupEnable'} = $TestGroupEnable;
+    
+        # __TestID = "450000";                                  # TestId for TestGroups
+        $FlowNodeData =~ s/__TestID\s*=\s*\"([\d\-]+)\"\s*;// && do {
+            $TestID = $1;
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'TestID'}     = $TestID;
+        };
+        # __PortNumber = 0;                                     # EndOfSubFlows
+        $FlowNodeData =~ s/__PortNumber\s*=\s*(\w+)\s*;// && do {
+            $PortNumber = $1;
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'PortNumber'} = $PortNumber;
+        };
+        # __AllBlocksLocal = __True;
+        $FlowNodeData =~ s/__AllBlocksLocal\s*=\s*(\w+)\s*;// && do {
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'AllBlocksLocal'} = $1;
+        };
+        # __PortSelect = "if(TestFlowFilter('', '', '18F43K22, 18F46K22, 18F45K22, 18F44K22', ''), 1, 0)";
+        $FlowNodeData =~ s/__PortSelect\s*=\s*\"([^\"]*)\"\s*;// && do {
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'PortSelect'} = $1;
+        };
+        
+        @Blocks = split(/\s*__Block\[/, $FlowNodeData);
+        # shift(@Blocks);                                         # remove pre-Block[0] data
+        foreach $nthBlock (1..$#Blocks) {
+            $BlockData = $Blocks[$nthBlock];
+            $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[0]->{'BlockCount'}++;
+            # __Title
+            # __Title = IVIO_Test;
+            $BlockData =~ s/__Title\s*=\s*(\w+)\s*\;// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'Title'} = $1;
+            };
+            # __EnableExpression
+            # __EnableExpression = __Expression { __String = "TRUE"; }
+            $BlockData =~ s/__EnableExpression\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'Enable'} = $1;
+            };
+            # __Name
+            # __Name = LTXC::FuncTest;
+            # __Name = CapCheck;
+            $BlockData =~ s/__Name\s*=\s*([\w\:]+)\s*;// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'ExecName'} = $1;
+            };
+            # __ContinueOnFail
+            # __ContinueOnFail = __Expression { __String = "FALSE"; }
+            $BlockData =~ s/__ContinueOnFail\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'ContinueOnFail'} = $1;
+            };
+            # FunctionCalls in CallAfterSetup, CallAtEnd
+            # CallAfterSetup = __Expression { __String = "&Reset_CM_FC"; }
+            # CallAtEnd = __Expression { __String = "&MeasureCurrent_CM_BAND42_ET_FC"; }
+            $BlockData =~ s/CallAfterSetup\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'CallAfterSetup'} = $1;
+            };
+            $BlockData =~ s/CallAtEnd\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'CallAtEnd'} = $1;
+            };
+            # TestLimitSource
+            # TestLimitSource = __Expression { __String = "LIMITS_TYPE_ENUM:USE_LOCAL_LIMITS"; }
+            # TestLimitSource = __Expression { __String = "LIMITS_TYPE_ENUM:USE_LIMIT_STRUCT"; }
+            # TestLimitSource = __Expression { __String = "DC_LIMITS_TYPE_ENUM:USE_LOCAL_LIMITS"; }
+            # TestLimitSource = __Expression { __String = "DC_LIMITS_TYPE_ENUM:USE_LIMIT_STRUCT"; }
+            # TestLimitSource = __Expression { __String = "DC_LIMITS_TYPE_ENUM:USE_LEVELS_SETUP"; }
+            $BlockData =~ s/TestLimitSource\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'TestLimitSource'} = $1;
+            };
+            # LimitStructure
+            # LimitStructure = __Expression { __String = "&IDD_POST_VLB_B12_LS"; }
+            $BlockData =~ s/LimitStructure\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'LimitStructure'} = $1;
+            };
+            # MinorID
+            # MinorID = __Expression { __String = "0"; }
+            $BlockData =~ s/\bMinorID\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'MinorID'} = $1;
+            };
+            # LowLimit
+            # LowLimit = __Expression { __String = "-2mA"; }
+            $BlockData =~ s/LowLimit\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'LowLimit'} = $1;
+            };
+            # HighLimit
+            # HighLimit = __Expression { __String = "5mA"; }
+            $BlockData =~ s/HighLimit\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'HighLimit'} = $1;
+            };
+            # DatalogText
+            # DatalogText = __Expression { __String = "'IDD_ISO_DTC0'"; }
+            $BlockData =~ s/DatalogText\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\'([^\']+)\'\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'DatalogText'} = $1;
+            };
+            # FailBin
+            # FailBin = __Expression { __String = "&FailFunc"; }
+            $BlockData =~ s/FailBin\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?\&([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'FailBin'} = $1;
+            };
+            # TestPins
+            # TestPins = __Expression { __String = "SCLK_SDATA_Pins"; }
+            $BlockData =~ s/TestPins\s*=\s*__Expression\s*\{\s*__String\s*=\s*\"?([^\"]+)\"?\s*;\s*\}// && do {
+                $SubFlowData{$SubFlowName}->{$FlowNodeName}->{'Block'}[$nthBlock]->{'TestPins'} = $1;
+            };
+        }
+    }
+
+    $break = 1;
+}
+
+# -------------------------------------------------------------------------
+sub get_next_line {
+    if ($in_include) {
+        if (eof(INCLUDE_FID)) {
+            $in_include = 0;                                    # if end of include file, reset flag, close FID, read next line from PATSRC_FILE FID
+            close(INCLUDE_FID);
+            $line_buf = <PATSRC_FILE>;
+        }
+        else {
+            $line_buf = <INCLUDE_FID>;                          # read next line from include FID
+        }
+    }
+    else {
+        $line_buf = <PATSRC_FILE>;                              # read next line from PATSRC_FILE FID
+    }
+}
+
+# -------------------------------------------------------------------------
+sub openBinToBinExtractCSV {
+    if ($Customer eq "pSemi") {
+        $TestPlanFileName = "$CurrentPath" . "$una_BaseFileName\_TestPlan.csv";
+        printf ">> -- Opening TestPlan file \"%s\" ...\n", $TestPlanFileName;
+        open(CSV, ">$TestPlanFileName");
+
+        printf CSV ",,,LimitStructData,,,LocalLimits,,,,,,\n";
+        #           A        C                          E         F          I                        J      K        L
+        printf CSV "Test Num,Test Name,LimitStruct Name,LowLimitA,HighLimitA,Units,LowLimit,HighLimit,HW Bin,BinNameA,SW Bin,FunctionCallAtEnd,FunctionName\n";
+    }
+    else {
+        $BinToBinOutputFileName = "$CurrentPath" . "$una_BaseFileName\_BinToBinOutput.csv";
+        printf ">> -- Opening BinToBinOutput file \"%s\" ...\n", $BinToBinOutputFileName;
+        open(CSV, ">$BinToBinOutputFileName");
+
+        printf CSV "Index,Test Number,Test Group Name,SubFlow,Bin Name,SW Bin,HW Bin,Comments\n";
+    }
+
+    goto SkipBinInformation;
+    # =================================================================================
+    foreach $BinName (sort keys(%BinData)) {                    # sort on SWBin number???
+        printf CSV "%d,%s,%s,%d,%d,%s\n",
+                   0, "", #$TestID, $TestGroupName,
+                   $BinName, $BinData{$BinName}->{'Number'}, $BinMapData{$ActiveBinMap}->{$BinName}, $BinData{$BinName}->{'Comment'};
+    }
+    # =================================================================================
+  SkipBinInformation:
+    
+    $break = 1;
+};
+
+# -------------------------------------------------------------------------
+sub WalkSubFlow {
+    local($SubFlowName) = @_;
+
+    # Rules for flow walk:
+    # Assuming flow continues out of Port 0 for every flow node.
+    # Assuming Port 1 of every TestGroup flow node leads to its failing Bin. If not, then no Bin is associated to that TestGroup.
+    # FlowWalk continues in every SubFlow until a Bin is reached from Port 0 (a Passing Bin), or an Exit flow node with PortNumber 0.
+    
+    $StartNode      = $SubFlowData{$SubFlowName}->{'StartNode'};
+    my $CurrentSubFlow = $SubFlowName;
+    my $CurrentNode    = $StartNode;
+    my $EndOfSubFlow   = 0;
+
+    # flow __Node, __Exec is another SubFlow
+#    __Node Vix_SubFlow_5 {
+#        __XCoord = (1115,38);
+#        __Port[0] { __PortPosition = 94; }
+#        __InputPosition = 272;
+#        __TestID = "200050";
+#        __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+#        __Exec = Vix_SubFlow;
+#    }
+
+    # flow __Node, __Exec is a Bin object
+#    __Node Pass_1_12 {
+#        __XCoord = (277,395);
+#        __InputPosition = 8;
+#        __TestID = "";
+#        __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+#        __Exec = Pass_1;
+#    }
+
+    # flow __TestGroup. __Exec is __Test, may have Inheritance or not...
+#    __TestGroup Continuity_Opens {
+#        __XCoord = (158,25);
+#        __Port[0] {
+#            __PortPosition = 90;
+#        }
+#        __Port[1] {
+#            __PortPosition = 180;
+#        }
+#        __InputPosition = 270;
+#        __TestID = "100000";
+#        __EnableExpression = __Expression { __String = "TRUE"; __Type = BOOLEAN; }
+#        __Exec = __Test {
+#            __Inherit = Continuity;
+#            ... may have locally defined TestGroup data...
+
+    do {
+        if (exists($SubFlowData{$CurrentSubFlow}->{'PortConnections'}->{$CurrentNode}[0])) {
+            my $NextNode = $SubFlowData{$CurrentSubFlow}->{'PortConnections'}->{$CurrentNode}[0];
+            #printf "Node  = %-30s  %s\n", $CurrentNode, $SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'TestID'};
+            #d printf "Node  = %-30s\n", $CurrentNode;
+
+            $CurrentNodeExec    = "";
+            $InheritedTestGroup = "";
+            $TestGroupName      = "";
+
+            # could be TestGroup, SubFlow, Bin
+            if (defined($SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'Exec'})) {
+                $CurrentNodeExec = $SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'Exec'};
+
+                # FlowNode is a __Node with __Exec to another SubFlow
+                if (exists($SubFlowData{$CurrentNodeExec})) {
+                    $cmd_opt{'log'} && printf "SubFlow    = %-30s\n", $CurrentNodeExec;
+                    &WalkSubFlow($CurrentNodeExec);
+            
+                    $CurrentNode = $NextNode;
+                }
+
+                # elsif (exists($BinData{$CurrentNodeExec})) {
+                #     $cmd_opt{'log'} && printf "\tBin       = %-30s\n", $CurrentNodeExec;
+                # }
+                
+                # FlowNode is a __TestGroup, could be defined in the SubFlow locally, could be Inherited, or a combination
+                elsif ($CurrentNodeExec eq "__Test") {
+                    
+                    &extractTestGroupData($CurrentSubFlow, $CurrentNode);
+
+                    $CurrentNode = $NextNode;
+                }  # end of 'elsif ($CurrentNodeExec eq "__Test")'
+                
+            }  # end of 'if (defined($SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'Exec'}))'
+            
+            # a SubFlow __Node
+            else {
+                $cmd_opt{'log'} && printf "\t__Node     = %-30s\n", $CurrentNode;
+
+                # check if this FlowNode has a Port1 and is a FlowControl decision FlowNode...
+                if ((exists($SubFlowData{$CurrentSubFlow}->{'PortConnections'}->{$CurrentNode}[1])) &&
+                    (exists($SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'PortSelect'}))) {
+                    my $NextNodePort0 = $NextNode;
+                
+                    my $NextNode = $SubFlowData{$CurrentSubFlow}->{'PortConnections'}->{$CurrentNode}[1];
+                    if ($SubFlowData{$CurrentSubFlow}->{$NextNode}->{'Exec'} eq "__Test") {
+                        
+                        &extractTestGroupData($CurrentSubFlow, $NextNode);
+
+                    }  # end of 'if ($SubFlowData{$CurrentSubFlow}->{$NextNode}->{'Exec'} eq "__Test")'
+                    $CurrentNode = $NextNodePort0;
+                }
+                else {
+                    $CurrentNode = $NextNode;
+                }
+            }
+            
+            # FlowNode is a __Node with __Exec to a Bin, and thus exiting a SubFlow
+      # 180515 never enters here!
+            if (exists($BinData{$SubFlowData{$CurrentSubFlow}->{$CurrentNodeExec}->{'Exec'}})) {
+                #printf "        Bin: $SubFlowData{$CurrentSubFlow}->{$NextNode}->{'Exec'}\n";
+                #$BinName = $SubFlowData{$SubFlowData{$CurrentSubFlow}->{$NextNode}->{'Exec'}};
+                $EndOfSubFlow = 1;
+            }
+            
+            # FlowNode is a __Node with __PortNumber indicating exit from SubFlow
+            # 181102 Program from Microchip 'LEBA0_F_DM10' uses FlowControl decision FlowNodes with PortNumber set to 0. BinToBin
+            #        assumes this to be end of SubFlow. Added check for non-existance of Port0 to validate this elsif clause.
+                elsif ((exists($SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'PortNumber'})) &&
+                   ($SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'PortNumber'} == 0) && (!exists($SubFlowData{$CurrentSubFlow}->{'PortConnections'}->{$CurrentNode}[0]))) {
+                $cmd_opt{'log'} && printf "SubFlowEnd = $CurrentSubFlow (__Node: PortNumber 0)\n";
+                
+                $EndOfSubFlow = 1;
+            }
+        }  # end of 'if (exists($SubFlowData{$CurrentSubFlow}->{'PortConnections'}->{$CurrentNode}[0]))'
+        else {
+            if ((exists($SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'PortNumber'})) &&
+                ($SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'PortNumber'} == 0)) {
+      # 180601 never enters here!
+                #printf "     __Node: PortNumber 0\n";
+                $cmd_opt{'log'} && printf "SubFlowEnd = $CurrentSubFlow (__Node: PortNumber 0)\n";
+            }
+            elsif (exists($BinData{$SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'Exec'}})) {
+                #printf "        Bin: $SubFlowData{$CurrentSubFlow}->{$NextNode}->{'Exec'}\n";
+                $BinName = $SubFlowData{$CurrentSubFlow}->{$CurrentNode}->{'Exec'};
+                $cmd_opt{'log'} && printf "SubFlowEnd = $CurrentSubFlow (__Bin : $BinName)\n";
+            }
+            $EndOfSubFlow = 1;
+        }
+        
+    } until $EndOfSubFlow;
+    $break = 1;
+}
+
+# -------------------------------------------------------------------------
+sub extractTestGroupData {
+    local($ThisSubFlow, $ThisTestGroupNode) = @_;
+
+    foreach $Attribute (keys %{$ThisTest}) { $ThisTest->{$Attribute}  = ""; }   # clear %ThisTest
+    
+    $TestGroupName = $ThisTestGroupNode;
+
+    $TestID  = "";
+    $BinName = "";
+                    
+    # __TestID
+    # __EnableExpression
+    # __Inherit
+    # __AllBlocksLocal
+    if (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'TestID'})) {
+        $TestID = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'TestID'};
+    }
+    if ((exists($SubFlowData{$ThisSubFlow}->{'PortConnections'}->{$ThisTestGroupNode}[1])) &&
+        (exists($BinData{$SubFlowData{$ThisSubFlow}->{$SubFlowData{$ThisSubFlow}->{'PortConnections'}->{$ThisTestGroupNode}[1]}->{'Exec'}}))) {
+        $BinName = $SubFlowData{$ThisSubFlow}->{$SubFlowData{$ThisSubFlow}->{'PortConnections'}->{$ThisTestGroupNode}[1]}->{'Exec'};;
+    }
+    $ThisTest->{'TestID'}    = $TestID;
+    $ThisTest->{'BinName'}   = $BinName;
+
+
+    $cmd_opt{'log'} && printf "\tTestGroup = %-30s  %-8s,  %s\n", $TestGroupName, $TestID, $BinName;
+
+    # determine whether there is Inheritance...
+    if (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Inherit'})) {
+        $InheritedTestGroup = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Inherit'};
+        $cmd_opt{'log'} && printf "\t\tInherits : $InheritedTestGroup\n";
+                        
+        # populate Setup and Block data from the Inherited TestGroup
+        &PopulateSubFlowFromInherit($ThisSubFlow, $ThisTestGroupNode, $InheritedTestGroup);
+    }
+    # if this statement is set, then don't bother with PopulateSubFlowFromInherit(?) (should go in if block above?)
+    if ((exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'AllBlocksLocal'})) &&
+        ($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'AllBlocksLocal'} eq "__True")) {
+        $cmd_opt{'log'} && printf "\t\tAllBlocksLocal ---\n";
+    }
+                    
+    for $BlockIndex (1..$SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[0]->{'BlockCount'}) {
+        #foreach $Attribute (keys %{$ThisTest}) { $ThisTest->{$Attribute}  = ""; }
+        #$ThisTest->{'TestID'}    = $TestID;
+        #$ThisTest->{'BinName'}   = $BinName;
+        undef %BinInfo;
+ 
+        # if (TestGroup) __EnableExpression eq FALSE, then skip this Block's processing...
+        if ($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'Enable'} eq "FALSE") { next; }
+                       
+        $cmd_opt{'log'} && printf "\t\tBlock[%d] : %s\n", $BlockIndex-1, $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'Title'};
+
+        # if Exec is a standard LTXC TestMethod...
+        if ($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'ExecName'} =~ /LTXC\:\:/) {
+            # if CallAfterSetup...
+            if (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'CallAfterSetup'})) {
+                $FunctionCallName = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'CallAfterSetup'};
+                $Function         = $FunctionCallData{$FunctionCallName}->{'Function'};
+                $cmd_opt{'log'} && printf "\t\t\tCallAfterSetup : %s --> %s\n", $FunctionCallName, $Function;
+            }
+
+            # if LimitStructure, get BinName and TestID...
+            if ($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'TestLimitSource'} =~ /USE_LIMIT_STRUCT/) {
+                $LimitStructure = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'LimitStructure'};
+                $ThisTest->{'LimitStructName'} = $LimitStructure;
+                $cmd_opt{'log'} && printf "\t\t\tLimitStructure : %s\n", $LimitStructure;
+                $ThisTest->{'TestName'}  = $LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'DLOG_STR'};
+                $ThisTest->{'BinName'}   = $LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'SW_BINA'};
+                $ThisTest->{'TestID'}    = $LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'TNUM'};    # this overrides flownode TestNum
+                $ThisTest->{'LowLimit_LS'}  = (exists($LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'LLIMA'})) ? $LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'LLIMA'} : "";
+                $ThisTest->{'HighLimit_LS'} = (exists($LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'HLIMA'})) ? $LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'HLIMA'} : "";
+                $ThisTest->{'Units'}     = (exists($LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'UNITS'})) ? $LimitTableData{$ActiveLimitTable}->{$LimitStructure}->{'UNITS'} : "";
+                $cmd_opt{'log'} && printf "\t\t\tTestNum %-8d, BinName %-20s, SBinNum %-4d    (LimitStructure)\n", $ThisTest->{'TestID'}, $ThisTest->{'BinName'}, $BinData{$ThisTest->{'BinName'}}->{'Number'};
+            }
+            # or if LocalLimits...
+            else {
+                # any Block-defined MinorID, DatalogText or FailBin...
+                $ThisTest->{'TestName'} = $TestGroupName;
+                if (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'MinorID'})) {
+                    $MinorID  = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'MinorID'};
+                    if ($MinorID == -1) {
+                        # get TestPins, how many Pins, determine range of TestIDs
+                        $cmd_opt{'log'} && printf "\t\t\tMinorID        : %d\n", $MinorID;
+                    }
+                    else {
+                        $cmd_opt{'log'} && printf "\t\t\tMinorID        : %d\n", $MinorID;
+                        $ThisTest->{'TestID'} = $TestID + $MinorID;
+                    }
+                }
+                                
+                if (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'DatalogText'})) {
+                    $ThisTest->{'TestName'} = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'DatalogText'};
+                }
+                if ((exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'FailBin'}))) {
+                    $BinName  = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'FailBin'};
+                    $cmd_opt{'log'} && printf "\t\t\tFailBin        : %s\n", $BinName;
+                }
+                                
+                #$ThisTest->{'LowLimit_LL'}  = (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'LowLimit'}))  ? $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'LowLimit'}  : "";
+                #$ThisTest->{'HighLimit_LL'} = (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'HighLimit'})) ? $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'HighLimit'} : "";
+            }
+            $ThisTest->{'LowLimit_LL'}  = (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'LowLimit'}))  ? $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'LowLimit'}  : "";
+            $ThisTest->{'HighLimit_LL'} = (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'HighLimit'})) ? $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'HighLimit'} : "";
+
+            # if CallAtEnd...
+            if (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'CallAtEnd'})) {
+                $FunctionCallName = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'CallAtEnd'};
+                $Function         = $FunctionCallData{$FunctionCallName}->{'Function'};
+                $cmd_opt{'log'} && printf "\t\t\tCallAtEnd      : %s --> %s\n", $FunctionCallName, $Function;
+                $ThisTest->{'FunctionCallName'} = $FunctionCallName;
+                $ThisTest->{'Function'}         = $Function;
+                                
+                for $ParameterIndex (1..$FunctionCallData{$FunctionCallName}->{'Parameter'}[0]->{'ParameterCount'}) {
+                    if (exists($BinData{$FunctionCallData{$FunctionCallName}->{'Parameter'}[$ParameterIndex]->{'Value'}})) {
+                        $FunctionArgument = $FunctionCallData{$FunctionCallName}->{'Parameter'}[$ParameterIndex]->{'Name'};
+                        $BinName          = $FunctionCallData{$FunctionCallName}->{'Parameter'}[$ParameterIndex]->{'Value'};
+                        $cmd_opt{'log'} && printf "\t\t\t\t%-12s : %s\n", $FunctionArgument, $BinName;
+                    }
+                }
+                                
+                $break = 1;
+            }
+                            
+        }  # end of 'if ($SubFlowData{$CurrentSubFlow}->{$TestGroupName}->{'Block'}[$BlockIndex]->{'ExecName'} =~ /LTXC\:\:/)'
+        # or a User-defined function...
+        else {
+            $ExecName = $SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Block'}[$BlockIndex]->{'ExecName'};
+            $cmd_opt{'log'} && printf "\t\t\tExec           : %s\n", $ExecName;
+
+            # look for Bins...
+                            
+            $ThisTest->{'TestName'} = $TestGroupName;
+            $ThisTest->{'BinName'}  = $BinName;
+            $ThisTest->{'TestID'}   = $TestID;
+                                
+            $break = 1;
+        }
+                                        
+        if ($Customer eq "pSemi") {
+            # pSemi : "Test Num,Test Name,LowLimitA,HighLimitA,Units,HW Bin,BinNameA,SW Bin"
+            printf CSV "%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+						if($lastTestID == $ThisTest->{'TestID'}){$lastTestID == '';continue;}
+						else{$lastTestID == $ThisTest->{'TestID'};}
+                        $ThisTest->{'TestID'},
+                        $ThisTest->{'TestName'},
+                        $ThisTest->{'LimitStructName'},
+                        $ThisTest->{'LowLimit_LS'},
+                        $ThisTest->{'HighLimit_LS'},
+                        $ThisTest->{'Units'},
+                        $ThisTest->{'LowLimit_LL'},
+                        $ThisTest->{'HighLimit_LL'},
+                        (exists($BinData{$ThisTest->{'BinName'}})) ? $BinMapData{$ActiveBinMap}->{$ThisTest->{'BinName'}} : "",
+                        $ThisTest->{'BinName'},
+                        (exists($BinData{$ThisTest->{'BinName'}})) ? $BinData{$ThisTest->{'BinName'}}->{'Number'} : "",
+                        $ThisTest->{'FunctionCallName'},
+                        $ThisTest->{'Function'};
+        }
+                    
+    }  # end of 'for $BlockIndex (1..$SubFlowData{$CurrentSubFlow}->{$TestGroupName}->{'Block'}[0]->{'BlockCount'})'
+            
+    #181107 (Check with Microchip!) if (($Customer eq "Microchip") && ($BinName ne "")) {
+    if ($Customer eq "Microchip") {
+        #181107 (Check with Microchip!) $TestGroupName = (exists($SubFlowData{$ThisSubFlow}->{$ThisTestGroupNode}->{'Inherit'})) ? $InheritedTestGroup : $TestGroupName;
+        # Microchip : "Index, TestNumber, TestGroupName, SubFlow, BinName, SWBin, HWBin, BinComment
+        #181107 (Check with Microchip!) printf CSV "%d,%d,%s,%s,%s,%d,%d,%s\n",
+        printf CSV "%d,%d,%s,%s,%s,%s,%s,%s\n",
+                    ++$Index,
+                    $TestID,
+                    $TestGroupName,
+                    $ThisSubFlow,
+                    #181107 (Check with Microchip!) $BinName, $BinData{$BinName}->{'Number'}, $BinMapData{$ActiveBinMap}->{$BinName}, $BinData{$BinName}->{'Comment'};
+                    $BinName,
+                    ($BinName ne "") ? $BinData{$BinName}->{'Number'}         : "",
+                    ($BinName ne "") ? $BinMapData{$ActiveBinMap}->{$BinName} : "",
+                    ($BinName ne "") ? $BinData{$BinName}->{'Comment'}        : "";
+    }
+}
+
+# -------------------------------------------------------------------------
+sub cleanupName {                       # rename to enVisionizeName??
+    local($Name, $CaseCommand) = @_;
+    $Name =~ s/\n//g;                                           # remove any newlines from string
+    if ($CaseCommand eq "Upper") { $Name =~ s/(.*)/\U$1/; }     # map to upper case
+    if ($CaseCommand eq "Lower") { $Name =~ s/(.*)/\L$1/; }     # map to lower case
+    if ($CaseCommand eq "AsIs")  { }                            # leave Name case as defined
+    $Name =~ s/\"//g;                                           # remove "" from Name (for subscripted pin groups)
+    $Name =~ s/\[(\d+)\]/_$1/g;                                 # change subscripted Name[0] to Name_0
+    $Name =~ s/[\.\-\+]/_/g;                                    # change ['.'|'-'|'+'] to '_'             # more ??
+    $Name =~ s/^(\d[\w]*)/_$1/;                                 # if Name starts with numeric, prepend '_'
+    return($Name);
+}
+
+# -------------------------------------------------------------------------
+sub PopulateSubFlowFromInherit {
+    local($CurrentSubFlow, $SubFlowTestGroup, $TestGroupName) = @_;
+    
+# =====================================================================================================
+#       'IVIO_0' => HASH(0x8a4c660)
+#          'Block' => ARRAY(0x8a4c654)
+#             0  HASH(0x8a2be78)
+#                'BlockCount' => 1
+#             1  HASH(0x8a2be9c)
+#                'DatalogText' => 'IVIO'
+#                'ExecName' => 'LTXC::DCTest'
+#                'LimitStructure' => 'IVIO_0_LS'
+#                'Title' => 'IVIO_Test'
+#          'Exec' => '__Test'
+#          'Inherit' => 'IVIO'
+#          'TestID' => 4
+# =====================================================================================================
+# =====================================================================================================
+#    'IVIO' => HASH(0x8a6b9b0)
+#       'Block' => ARRAY(0x8a843cc)
+#          0  HASH(0x8a843e4)
+#             'BlockCount' => 2
+#          1  HASH(0x8a84408)
+#             'ContinueOnFail' => 'TRUE'
+#             'DatalogText' => 'IVIO'
+#             'Enable' => 'TRUE'
+#             'LimitStructure' => 'IVIO_0_LS'
+#             'MinorID' => 0
+#             'Title' => 'IVIO_Test'
+#          2  HASH(0x8a84468)
+#             'Title' => 'SaveIvioPostValues_Test'
+#       'TestID' => 300004
+# =====================================================================================================
+    if ((!exists($SubFlowData{$CurrentSubFlow}->{$SubFlowTestGroup}->{'TestID'})) && (exists($TestGroupData{$TestGroupName}->{'TestID'}))) {
+        $SubFlowData{$CurrentSubFlow}->{$SubFlowTestGroup}->{'TestID'} = $TestGroupData{$TestGroupName}->{'TestID'};
+    }
+    for $BlockIndex (1..$TestGroupData{$TestGroupName}->{'Block'}[0]->{'BlockCount'}) {
+        for $Attribute ("Title", "Enable", "ContinueOnFail", "MinorID", "LowLimit", "HighLimit", "DatalogText", "FailBin", "TestLimitSource", "LimitStructure", "CallAfterSetup", "CallAtEnd") {
+            if ((!exists($SubFlowData{$CurrentSubFlow}->{$SubFlowTestGroup}->{'Block'}[$BlockIndex]->{$Attribute})) &&
+                (exists($TestGroupData{$TestGroupName}->{'Block'}[$BlockIndex]->{$Attribute}))) {
+                $SubFlowData{$CurrentSubFlow}->{$SubFlowTestGroup}->{'Block'}[$BlockIndex]->{$Attribute} = $TestGroupData{$TestGroupName}->{'Block'}[$BlockIndex]->{$Attribute};
+            }
+        }
+    }
+    if ((!exists($SubFlowData{$CurrentSubFlow}->{$SubFlowTestGroup}->{'Block'}[0]->{'BlockCount'})) ||
+        ($SubFlowData{$CurrentSubFlow}->{$SubFlowTestGroup}->{'Block'}[0]->{'BlockCount'} < $TestGroupData{$TestGroupName}->{'Block'}[0]->{'BlockCount'})) {
+        $SubFlowData{$CurrentSubFlow}->{$SubFlowTestGroup}->{'Block'}[0]->{'BlockCount'} = $TestGroupData{$TestGroupName}->{'Block'}[0]->{'BlockCount'};
+    }
+    $break = 1;
+}
+
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
